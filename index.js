@@ -5,7 +5,7 @@ const app = express();
 // This is the "Brain" that finds the secret TV links
 async function findStreamDetails(targetUrl) {
     const browser = await chromium.launch({ 
-        headless: true, // Runs invisibly
+        headless: true, 
         args: ['--no-sandbox', '--disable-setuid-sandbox'] 
     });
     
@@ -16,44 +16,42 @@ async function findStreamDetails(targetUrl) {
     const page = await context.newPage();
     let streamData = { url: null, license: null, headers: {} };
 
-    // This "sniffs" the website traffic as it loads
+    // Listen for requests
     page.on('request', request => {
         const url = request.url();
         
-        // Look for the Video Link (Manifest)
+        // Log what we find to Railway logs so you can see it!
         if (url.includes('.m3u8') || url.includes('.mpd')) {
+            console.log("Found Video Link:", url);
             streamData.url = url;
         }
         
-        // Look for the "Digital Key" (DRM License)
         if (url.includes('widevine') || url.includes('license') || url.includes('clearkey')) {
+            console.log("Found License Link:", url);
             streamData.license = url;
-            streamData.headers = request.headers(); // Save the "ID card" needed for the key
+            streamData.headers = request.headers();
         }
     });
 
     try {
+        // Increase timeout to 60s for slow TV sites
         await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 60000 });
-        // Wait 5 seconds to make sure the player actually starts
-        await page.waitForTimeout(5000); 
+        
+        // --- NEW: Trigger the player ---
+        // Some sites need a small scroll or click to start the player
+        await page.mouse.wheel(0, 500); 
+        
+        // Wait 10 seconds (instead of 5) to give the player time to 'handshake'
+        await new Promise(resolve => setTimeout(resolve, 10000)); 
+        
     } catch (e) {
-        console.log("Error loading page: ", e);
+        console.log("Error loading page: ", e.message);
     } finally {
         await browser.close();
     }
 
     return streamData;
 }
-
-// This creates the "Phone Line" for your Android TV app to call
-app.get('/resolve', async (req, res) => {
-    const target = req.query.url;
-    if (!target) return res.status(400).send({ error: "Missing URL" });
-
-    console.log("Searching for links on:", target);
-    const results = await findStreamDetails(target);
-    res.json(results);
-});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Middleman is running on port ${PORT}`));
