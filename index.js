@@ -2,7 +2,6 @@ const { chromium } = require('playwright');
 const express = require('express');
 const app = express();
 
-// This is the "Brain" that finds the secret TV links
 async function findStreamDetails(targetUrl) {
     const browser = await chromium.launch({ 
         headless: true, 
@@ -10,22 +9,24 @@ async function findStreamDetails(targetUrl) {
     });
     
     const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
     });
     
     const page = await context.newPage();
+    
+    // STEALTH MODE: Makes the website think this is a real person, not a bot
+    await page.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    });
+
     let streamData = { url: null, license: null, headers: {} };
 
-    // Listen for requests
     page.on('request', request => {
         const url = request.url();
-        
-        // Log what we find to Railway logs so you can see it!
         if (url.includes('.m3u8') || url.includes('.mpd')) {
             console.log("Found Video Link:", url);
             streamData.url = url;
         }
-        
         if (url.includes('widevine') || url.includes('license') || url.includes('clearkey')) {
             console.log("Found License Link:", url);
             streamData.license = url;
@@ -34,15 +35,12 @@ async function findStreamDetails(targetUrl) {
     });
 
     try {
-        // Increase timeout to 60s for slow TV sites
+        console.log(`Navigating to: ${targetUrl}`);
         await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 60000 });
         
-        // --- NEW: Trigger the player ---
-        // Some sites need a small scroll or click to start the player
+        // Scroll and wait to trigger the player
         await page.mouse.wheel(0, 500); 
-        
-        // Wait 10 seconds (instead of 5) to give the player time to 'handshake'
-        await new Promise(resolve => setTimeout(resolve, 10000)); 
+        await new Promise(resolve => setTimeout(resolve, 12000)); // 12 seconds for safety
         
     } catch (e) {
         console.log("Error loading page: ", e.message);
@@ -52,6 +50,25 @@ async function findStreamDetails(targetUrl) {
 
     return streamData;
 }
+
+// --- THIS PART WAS MISSING ---
+// This is the route your Android app calls: /resolve?url=...
+app.get('/resolve', async (req, res) => {
+    const target = req.query.url;
+    if (!target) return res.status(400).send({ error: "Missing URL" });
+
+    console.log("--- New Request Received ---");
+    const results = await findStreamDetails(target);
+    
+    // If we found nothing, let the app know
+    if (!results.url) {
+        console.log("FAILED: No stream links found.");
+    } else {
+        console.log("SUCCESS: Sending links to ACtv app.");
+    }
+    
+    res.json(results);
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Middleman is running on port ${PORT}`));
