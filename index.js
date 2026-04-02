@@ -7,33 +7,41 @@ const TARGET_SITE = "https://iyadtv.pages.dev/";
 
 // 1. THE AUTOMATIC CHANNEL SCRAPER
 async function fetchLiveChannels() {
-    console.log("--- Scraping fresh list from iyadtv ---");
+    console.log("--- Starting Deep Scrape of iyadtv ---");
     const browser = await chromium.launch({ 
         headless: true, 
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] 
     });
-    const page = await browser.newPage();
+    const context = await browser.newContext({
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    });
+    const page = await context.newPage();
     
     try {
-        await page.goto(TARGET_SITE, { waitUntil: 'networkidle', timeout: 30000 });
+        // 1. Visit the site and wait for it to be fully "still"
+        await page.goto(TARGET_SITE, { waitUntil: 'networkidle', timeout: 60000 });
 
-        // This scans the website for all links (<a> tags) that contain channel info
+        // 2. Give it an extra 3 seconds just in case there's a fade-in animation
+        await new Promise(r => setTimeout(r, 3000));
+
+        // 3. Extract every link that looks like a channel
         const channels = await page.evaluate(() => {
-            const cards = Array.from(document.querySelectorAll('a')); 
+            // Find all anchor tags
+            const anchors = Array.from(document.querySelectorAll('a'));
             
-            return cards.map((card, index) => {
-                const name = card.innerText.trim();
-                const img = card.querySelector('img')?.src;
-                const url = card.href;
+            return anchors.map((a, index) => {
+                const name = a.innerText.trim();
+                const img = a.querySelector('img')?.src;
+                const href = a.href;
 
-                // Only include if there is a name and a link
-                if (name && url && !url.includes('javascript:')) {
+                // FILTER: Only grab links that aren't social media or home buttons
+                if (name.length > 1 && !href.includes('facebook') && !href.includes('twitter')) {
                     return {
                         id: String(index + 1),
                         name: name,
                         logoUrl: img || null,
                         category: "LIVE",
-                        websiteUrl: url,
+                        websiteUrl: href,
                         directUrl: null
                     };
                 }
@@ -41,65 +49,12 @@ async function fetchLiveChannels() {
             }).filter(item => item !== null);
         });
 
-        console.log(`Successfully indexed ${channels.length} channels.`);
+        console.log(`Deep Scrape found ${channels.length} items.`);
         return channels;
     } catch (e) {
-        console.error("Scrape Error:", e.message);
+        console.error("Scrape Error Details:", e.message);
         return [];
     } finally {
         await browser.close();
     }
 }
-
-// 2. THE CHANNELS ROUTE
-app.get('/channels', async (req, res) => {
-    try {
-        const list = await fetchLiveChannels();
-        res.json(list);
-    } catch (err) {
-        res.status(500).json({ error: "Failed to scrape channels" });
-    }
-});
-
-// 3. THE RESOLVER (Ghost Browser for stream links)
-async function findStreamDetails(targetUrl) {
-    console.log(`--- Resolving Stream: ${targetUrl} ---`);
-    const browser = await chromium.launch({ 
-        headless: true, 
-        args: ['--no-sandbox', '--disable-setuid-sandbox'] 
-    });
-    const page = await browser.newPage();
-    let streamData = { videoUrl: null, licenseUrl: null, headers: {} };
-
-    page.on('request', request => {
-        const url = request.url();
-        if (url.includes('.m3u8') || url.includes('.mpd')) streamData.videoUrl = url;
-        if (url.includes('widevine') || url.includes('license')) {
-            streamData.licenseUrl = url;
-            streamData.headers = request.headers();
-        }
-    });
-
-    try {
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-        await new Promise(r => setTimeout(r, 5000)); 
-    } catch (e) {
-        console.log("Resolve Timeout:", e.message);
-    } finally {
-        await browser.close();
-    }
-    return streamData;
-}
-
-app.get('/resolve', async (req, res) => {
-    const url = req.query.url;
-    if (!url) return res.json({ error: "No URL" });
-    const result = await findStreamDetails(url);
-    res.json(result);
-});
-
-app.get('/', (req, res) => res.send("ACtv Station is Awake and Online!"));
-
-app.listen(port, "0.0.0.0", () => {
-    console.log(`ACtv Station LIVE on port ${port}`);
-});
