@@ -49,14 +49,14 @@ app.get('/channels', async (req, res) => {
     }
 });
 
-// --- ENDPOINT 2: THE REAL RESOLVER (The Sniffer) ---
+// --- ENDPOINT 2: THE UNIVERSAL RESOLVER ---
 app.get('/resolve', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send("No URL provided");
 
     let browser;
     try {
-        console.log(`Starting Multi-Step Sniff for: ${targetUrl}`);
+        console.log(`Flexible Sniffing for: ${targetUrl}`);
         browser = await chromium.launch(launchOptions);
         
         const page = await browser.newPage({
@@ -66,71 +66,69 @@ app.get('/resolve', async (req, res) => {
 
         let foundUrl = null;
 
-        // Sniffer is active throughout the session
+        // --- SMART SNIFFER LOGIC ---
         page.on('response', response => {
             const url = response.url();
-            if (url.includes('.m3u8') || url.includes('.mpd')) {
-                // Filter out common analytics/ad tracking m3u8s if they exist
-                if (!url.includes('analytics') && !url.includes('telemetry')) {
+            const contentType = response.headers()['content-type'] || '';
+            
+            // 1. Check by common streaming extensions
+            const isStreamExtension = url.includes('.m3u8') || 
+                                     url.includes('.mpd') || 
+                                     url.includes('.m4s') || 
+                                     url.includes('.ts');
+
+            // 2. Check by Content-Type (covers hidden/renamed streams)
+            const isStreamType = contentType.includes('mpegurl') || 
+                                contentType.includes('dash+xml') || 
+                                contentType.includes('video/mp2t');
+
+            if ((isStreamExtension || isStreamType) && !url.includes('analytics')) {
+                // If we find a master playlist or manifest, prioritize that
+                if (url.includes('master') || url.includes('manifest')) {
+                    foundUrl = url;
+                } else if (!foundUrl) {
                     foundUrl = url;
                 }
             }
         });
 
-        // STEP 1: Load the initial watch page
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await new Promise(r => setTimeout(r, 3000));
+        await new Promise(r => setTimeout(r, 2500));
 
-        // STEP 2: Trigger the Popup
-        // We click the center where the "Watch" or "Play" button usually sits
-        console.log("Triggering channel popup...");
+        // Click to trigger the player popup
         await page.mouse.click(640, 360); 
         await new Promise(r => setTimeout(r, 2500));
 
-        // STEP 3: Select the 1st Stream Option
-        // We look for "Server 1", "Stream 1", or simply buttons containing "1"
-        const clickResult = await page.evaluate(() => {
-            const elements = Array.from(document.querySelectorAll('button, a, li, span'));
-            const firstStream = elements.find(el => {
-                const text = el.innerText.toLowerCase();
-                return (text.includes('server 1') || text.includes('stream 1') || text === '1');
+        // Click the first available stream source
+        await page.evaluate(() => {
+            const options = Array.from(document.querySelectorAll('a, button, li, .stream-link'));
+            const first = options.find(el => {
+                const text = el.innerText.trim().toLowerCase();
+                return text === '1' || text.includes('server 1') || text.includes('stream 1');
             });
-
-            if (firstStream) {
-                firstStream.click();
-                return "Clicked Stream 1";
-            }
-            return "No specific stream button found";
+            if (first) first.click();
         });
         
-        console.log(`Selection Step: ${clickResult}`);
-
-        // STEP 4: Final wait for the sniffer to catch the hidden link
-        // We give it up to 20 seconds because of the multi-click nature
+        // Wait up to 20s for the player to negotiate the stream
         for (let i = 0; i < 20; i++) {
             if (foundUrl) break;
-            
-            // Emergency click at the 7-second mark if nothing is happening
-            if (i === 7) {
-                console.log("Sending emergency interaction click...");
-                await page.mouse.click(640, 360);
-            }
+            if (i === 10) await page.mouse.click(640, 360); // Emergency re-click
             await new Promise(r => setTimeout(r, 1000));
         }
 
         if (foundUrl) {
-            console.log(`Success! Stream caught: ${foundUrl}`);
+            console.log(`Success! Flexible stream caught: ${foundUrl}`);
             res.json({ success: true, url: foundUrl });
         } else {
-            throw new Error("Could not find a valid stream link after navigating the popup.");
+            throw new Error("No video stream (HLS/DASH/TS) detected.");
         }
 
     } catch (error) {
-        console.error("Sniffer Error:", error.message);
+        console.error("Resolver Error:", error.message);
         res.status(500).json({ success: false, error: error.message });
     } finally {
         if (browser) await browser.close();
     }
 });
 
-app.listen(PORT, () => console.log(`ACtv Backend (Multi-Step Mode) Active on Port ${PORT}`));
+app.listen(PORT, () => console.log(`ACtv Backend (Universal Mode) Active on Port ${PORT}`));
