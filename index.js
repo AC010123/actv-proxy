@@ -2,16 +2,16 @@ const express = require('express');
 const { chromium } = require('playwright');
 const app = express();
 
-// This tells Railway which "door" to use to talk to the internet
+// Use the door Railway gives us
 const port = process.env.PORT || 3000;
 
 async function findStreamDetails(targetUrl) {
-    console.log(`--- Starting Search for: ${targetUrl} ---`);
+    console.log(`--- Searching: ${targetUrl} ---`);
     
-    // Launch the "Ghost Browser"
+    // Launch a "Lite" version of the browser
     const browser = await chromium.launch({ 
         headless: true, 
-        args: ['--no-sandbox', '--disable-setuid-sandbox'] 
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] 
     });
     
     const context = await browser.newContext({
@@ -21,42 +21,36 @@ async function findStreamDetails(targetUrl) {
     
     const page = await context.newPage();
 
-    // Stealth Mode: Makes the website think we are a real person
-    await page.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => false });
-    });
-
     let streamData = { videoUrl: null, licenseUrl: null, headers: {} };
 
-    // This "sniffs" the internet air to find the video links
+    // This "sniffs" the air for video links
     page.on('request', request => {
         const url = request.url();
         if (url.includes('.m3u8') || url.includes('.mpd')) {
-            console.log("FOUND VIDEO LINK:", url);
             streamData.videoUrl = url;
         }
         if (url.includes('widevine') || url.includes('license') || url.includes('clearkey')) {
-            console.log("FOUND LICENSE KEY:", url);
             streamData.licenseUrl = url;
             streamData.headers = request.headers();
         }
     });
 
     try {
-        // We give the website 30 seconds to show us the video
-        await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 30000 });
+        // Step 1: Go to the site but don't wait for images/ads (saves RAM)
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
 
-        // Click the middle of the screen to start the player automatically
+        // Step 2: Click the player to wake it up
         await page.mouse.click(640, 360); 
         
-        // Wait a few seconds for the "handshake" to finish
-        await new Promise(resolve => setTimeout(resolve, 8000)); 
+        // Step 3: Wait just 5 seconds for the link to appear
+        await new Promise(resolve => setTimeout(resolve, 5000)); 
         
     } catch (e) {
-        console.log("Search timed out or failed: ", e.message);
+        console.log("Search took too long: ", e.message);
     } finally {
+        // Step 4: Kill the browser immediately to free up memory
         await browser.close();
-        console.log("--- Search Finished ---");
+        console.log("--- Search Done ---");
     }
 
     return streamData;
@@ -64,7 +58,6 @@ async function findStreamDetails(targetUrl) {
 
 // --- THE BROADCAST TOWER ---
 
-// This is what your Android TV app will "call"
 app.get('/resolve', async (req, res) => {
     const url = req.query.url;
     
@@ -74,13 +67,13 @@ app.get('/resolve', async (req, res) => {
 
     try {
         const result = await findStreamDetails(url);
-        res.json(result); // Sends the video link back to your TV
+        res.json(result); 
     } catch (err) {
-        res.status(500).json({ error: "Server got tired. Try again." });
+        res.status(500).json({ error: "Station overloaded. Try again." });
     }
 });
 
-// Start the station
+// Wake up the station
 app.listen(port, "0.0.0.0", () => {
     console.log(`ACtv Station is LIVE on port ${port}`);
 });
