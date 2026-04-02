@@ -5,41 +5,44 @@ const app = express();
 const port = process.env.PORT || 8080;
 const TARGET_SITE = "https://iyadtv.pages.dev/";
 
-// 1. THE AUTOMATIC CHANNEL SCRAPER
+// Cache variables to prevent constant slow scraping
+let cachedChannels = null;
+let lastFetchTime = 0;
+const CACHE_DURATION = 30 * 60 * 1000; // 30 minutes
+
 async function fetchLiveChannels() {
-    console.log("--- Starting Deep Scrape of iyadtv ---");
+    // If we have a fresh cache, use it immediately!
+    if (cachedChannels && (Date.now() - lastFetchTime < CACHE_DURATION)) {
+        console.log("Serving channels from cache...");
+        return cachedChannels;
+    }
+
+    console.log("--- Starting Speed Scrape ---");
     const browser = await chromium.launch({ 
         headless: true, 
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] 
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'] 
     });
-    const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    });
-    const page = await context.newPage();
     
     try {
-        // 1. Visit the site and wait for it to be fully "still"
-        await page.goto(TARGET_SITE, { waitUntil: 'networkidle', timeout: 60000 });
+        const context = await browser.newContext();
+        const page = await context.newPage();
+        
+        // Block images and CSS to make the scrape 5x faster
+        await page.route('**/*.{png,jpg,jpeg,css,woff,svg}', route => route.abort());
 
-        // 2. Give it an extra 3 seconds just in case there's a fade-in animation
-        await new Promise(r => setTimeout(r, 3000));
+        await page.goto(TARGET_SITE, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        // 3. Extract every link that looks like a channel
         const channels = await page.evaluate(() => {
-            // Find all anchor tags
             const anchors = Array.from(document.querySelectorAll('a'));
-            
             return anchors.map((a, index) => {
                 const name = a.innerText.trim();
-                const img = a.querySelector('img')?.src;
                 const href = a.href;
-
-                // FILTER: Only grab links that aren't social media or home buttons
-                if (name.length > 1 && !href.includes('facebook') && !href.includes('twitter')) {
+                // Basic filter for channel links
+                if (name.length > 1 && href.includes('http') && !href.includes('google')) {
                     return {
                         id: String(index + 1),
                         name: name,
-                        logoUrl: img || null,
+                        logoUrl: null, // Images blocked for speed, but names will load!
                         category: "LIVE",
                         websiteUrl: href,
                         directUrl: null
@@ -49,12 +52,46 @@ async function fetchLiveChannels() {
             }).filter(item => item !== null);
         });
 
-        console.log(`Deep Scrape found ${channels.length} items.`);
+        cachedChannels = channels;
+        lastFetchTime = Date.now();
         return channels;
     } catch (e) {
-        console.error("Scrape Error Details:", e.message);
-        return [];
+        console.error("Scrape Error:", e.message);
+        return cachedChannels || []; // Return old cache if new scrape fails
     } finally {
         await browser.close();
     }
 }
+
+app.get('/channels', async (req, res) => {
+    // Send a response quickly to avoid Railway timeout
+    const list = await fetchLiveChannels();
+    res.json(list);
+});
+
+// Resolver stays the same for individual links
+app.get('/resolve', async (req, res) => {
+    const url = req.query.url;
+    if (!url) return res.json({ error: "No URL" });
+    
+    const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+    const page = await browser.newPage();
+    let streamData = { videoUrl: null, licenseUrl: null };
+
+    page.on('request', r => {
+        const u = r.url();
+        if (u.includes('.m3u8') || u.includes('.mpd')) streamData.videoUrl = u;
+    });
+
+    try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await new Promise(r => setTimeout(r, 4000));
+    } finally {
+        await browser.close();
+    }
+    res.json(streamData);
+});
+
+app.get('/', (req, res) => res.send("Station Active"));
+
+app.listen(port, "0.0.0.0", () => console.log(`Online on ${port}`));
