@@ -1,5 +1,0 @@
-[phases.setup]
-nixPkgs = ["...", "nodejs", "playwright-driver"]
-
-[phases.install]
-cmds = ["npm install", "npx playwright install chromium"]
