@@ -20,16 +20,15 @@ async function fetchLiveChannels() {
         browser = await chromium.launch({ 
             args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] 
         });
-        const context = await browser.newContext();
+        const context = await browser.newContext({
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        });
         const page = await context.newPage();
         
-        // Speed up scraping by ignoring images/css during the initial scan
         await page.route('**/*.{png,jpg,jpeg,css,svg,woff}', route => route.abort());
-        
         await page.goto(TARGET_SITE, { waitUntil: 'networkidle', timeout: 60000 });
 
         const channels = await page.evaluate((baseUrl) => {
-            // Target the cards/buttons specifically
             const elements = Array.from(document.querySelectorAll('a, [onclick], .grid-item'));
             
             const filtered = elements.map((el) => {
@@ -37,12 +36,9 @@ async function fetchLiveChannels() {
                 const img = el.querySelector('img')?.src || null;
                 const onclick = el.getAttribute('onclick') || "";
 
-                // 1. THE "JUNK" FILTER: Remove non-media tiles
                 const isJunk = /Contact|Support|Version|Close|Discord|Telegram|Update|v1\./i.test(name);
                 if (isJunk || !name || name.length < 2) return null;
 
-                // 2. EXTRACT PLAY ID: Look for the slug in the onclick function
-                // Example: onclick="play('tv5')" -> extracts 'tv5'
                 const match = onclick.match(/'([^']+)'/);
                 const slug = match ? match[1] : null;
 
@@ -54,14 +50,12 @@ async function fetchLiveChannels() {
                 };
             }).filter(item => item !== null && item.websiteUrl !== null);
 
-            // Deduplicate by name to prevent repeating "Contact Us" or navigation duplicates
             return Array.from(new Map(filtered.map(c => [c.name, c])).values());
         }, TARGET_SITE);
 
-        // Re-assign IDs so they are clean (1, 2, 3...) after filtering
         const finalChannels = channels.map((c, i) => ({ id: String(i + 1), ...c }));
-
         console.log(`Successfully indexed ${finalChannels.length} clean channels.`);
+        
         cachedChannels = finalChannels;
         lastFetchTime = Date.now();
         return finalChannels;
@@ -81,25 +75,41 @@ app.get('/channels', async (req, res) => {
 
 app.get('/resolve', async (req, res) => {
     const url = req.query.url;
-    if (!url) return res.status(400).json({ error: "No URL provided" });
+    if (!url || url === "null") return res.status(400).json({ error: "Invalid URL" });
     
     let browser;
     try {
+        // Use a realistic user agent to prevent being blocked by the player provider
         browser = await chromium.launch({ args: ['--no-sandbox'] });
-        const page = await browser.newPage();
+        const context = await browser.newContext({
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        });
+        const page = await context.newPage();
+        
         let streamData = { videoUrl: null, licenseUrl: null };
 
+        // IMPROVED LISTENER: Prioritize Master Playlists and block segments
         page.on('request', r => {
             const u = r.url();
-            if (u.includes('.m3u8') || u.includes('.mpd')) streamData.videoUrl = u;
-            if (u.includes('widevine') || u.includes('license') || u.includes('clearkey')) {
+            
+            // Look for HLS (.m3u8) or DASH (.mpd)
+            // We exclude 'chunk' or 'segment' to ensure we get the main stream URL
+            if ((u.includes('.m3u8') || u.includes('.mpd')) && !u.includes('chunk') && !u.includes('segment')) {
+                streamData.videoUrl = u;
+            }
+
+            // Look for DRM Licenses (Widevine/ClearKey)
+            if (u.includes('widevine') || u.includes('license') || u.includes('clearkey') || u.includes('drm')) {
                 streamData.licenseUrl = u;
             }
         });
 
-        await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
-        await new Promise(r => setTimeout(r, 8000)); // Wait for player to init
+        await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
         
+        // Wait longer for the video player to perform the DRM handshake
+        await new Promise(r => setTimeout(r, 12000)); 
+        
+        console.log(`Resolved: ${streamData.videoUrl ? 'Success' : 'Failed'}`);
         res.json(streamData);
     } catch (e) {
         res.status(500).json({ error: e.message });
