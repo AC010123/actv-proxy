@@ -8,19 +8,29 @@ async function fetchLiveChannels() {
     let browser;
     try {
         browser = await chromium.launch({ 
-            headless: true, // MUST be true for Railway
+            headless: true,
             args: [
                 '--no-sandbox', 
                 '--disable-setuid-sandbox', 
                 '--disable-dev-shm-usage',
-                '--disable-gpu'
+                '--disable-gpu',
+                '--single-process' // Helps with memory on Railway
             ] 
         });
         
-        const page = await browser.newPage();
-        // Block heavy stuff to save RAM
-        await page.route('**/*.{png,jpg,jpeg,css,woff,svg}', route => route.abort());
+        const context = await browser.newContext();
+        const page = await context.newPage();
         
+        // Block everything except the HTML to save resources
+        await page.route('**/*', (route) => {
+            const type = route.request().resourceType();
+            if (['document', 'script'].includes(type)) {
+                route.continue();
+            } else {
+                route.abort();
+            }
+        });
+
         await page.goto(TARGET_SITE, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
         const channels = await page.evaluate(() => {
@@ -28,7 +38,7 @@ async function fetchLiveChannels() {
             return links.map((a, index) => {
                 const name = a.innerText.trim();
                 const href = a.href;
-                if (name.length > 1 && href.startsWith('http') && !href.includes('google')) {
+                if (name.length > 1 && href.startsWith('http')) {
                     return {
                         id: String(index + 1),
                         name: name,
@@ -51,8 +61,6 @@ async function fetchLiveChannels() {
         console.error("SCRAPE ERROR:", e.message);
         return cachedChannels || [];
     } finally {
-        if (browser) {
-            await browser.close();
-        }
+        if (browser) await browser.close();
     }
 }
