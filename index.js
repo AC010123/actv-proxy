@@ -56,42 +56,46 @@ app.get('/resolve', async (req, res) => {
 
     let browser;
     try {
-        console.log(`Resolving stream for: ${targetUrl}`);
+        console.log(`Sniffing: ${targetUrl}`);
         browser = await chromium.launch(launchOptions);
         const page = await browser.newPage();
 
-        // 1. Create a promise that triggers when an .m3u8 link is found in the network
-        const streamPromise = new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error("Stream timeout")), 25000);
-            
-            page.on('response', response => {
-                const url = response.url();
-                if (url.includes('.m3u8')) {
-                    clearTimeout(timeout);
-                    resolve(url);
-                }
-            });
+        // 1. Set a faster User-Agent so the site thinks we're a real TV/Browser
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36');
+
+        let foundUrl = null;
+
+        // 2. Start sniffing immediately
+        page.on('response', response => {
+            const url = response.url();
+            if (url.includes('.m3u8') || url.includes('.mpd')) {
+                foundUrl = url;
+            }
         });
 
-        // 2. Navigate to the watch page
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        // 3. Go to the page and wait for the "Play" area to exist
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        
+        // 4. Force a click in the middle of the screen to trigger auto-play
+        // Many sites block video until a "user interaction" happens
+        await page.mouse.click(400, 300); 
+        console.log("Simulated click to trigger stream...");
 
-        // 3. Try to click a play button if one exists (optional but helps some sites)
-        try {
-            await page.click('video', { timeout: 2000 });
-        } catch (e) { /* ignore if no video element found yet */ }
+        // 5. Wait up to 15 seconds for the sniffer to catch the link
+        for (let i = 0; i < 15; i++) {
+            if (foundUrl) break;
+            await new Promise(r => setTimeout(r, 1000));
+        }
 
-        // 4. Wait for the sniffer to find the link
-        const finalStreamUrl = await streamPromise;
-
-        console.log(`Found stream: ${finalStreamUrl}`);
-        res.json({
-            success: true,
-            url: finalStreamUrl
-        });
+        if (foundUrl) {
+            console.log(`Stream caught: ${foundUrl}`);
+            res.json({ success: true, url: foundUrl });
+        } else {
+            throw new Error("Could not find a valid stream link on this page.");
+        }
 
     } catch (error) {
-        console.error("Resolution Error:", error.message);
+        console.error("Sniffer Error:", error.message);
         res.status(500).json({ success: false, error: error.message });
     } finally {
         if (browser) await browser.close();
