@@ -7,7 +7,7 @@ const TARGET_SITE = "https://iyadtv.pages.dev/";
 
 let cachedChannels = null;
 let lastFetchTime = 0;
-const CACHE_DURATION = 15 * 60 * 1000; 
+const CACHE_DURATION = 10 * 60 * 1000; 
 
 async function fetchLiveChannels() {
     if (cachedChannels && (Date.now() - lastFetchTime < CACHE_DURATION)) {
@@ -17,19 +17,35 @@ async function fetchLiveChannels() {
     console.log("--- Refreshing ACtv Channel List ---");
     let browser;
     try {
+        // STEALTH: Added more flags to bypass bot detection on Railway
         browser = await chromium.launch({ 
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] 
+            args: [
+                '--no-sandbox', 
+                '--disable-setuid-sandbox', 
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled'
+            ] 
         });
+        
         const context = await browser.newContext({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            viewport: { width: 1280, height: 720 }
         });
+
         const page = await context.newPage();
         
-        // Load the site and wait for the grid to appear
-        await page.goto(TARGET_SITE, { waitUntil: 'networkidle', timeout: 60000 });
+        // Go to site and wait for the actual grid to load
+        await page.goto(TARGET_SITE, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        
+        // WAIT: Specifically wait for the channel cards to appear in the DOM
+        try {
+            await page.waitForSelector('[onclick*="play"]', { timeout: 15000 });
+        } catch (e) {
+            console.log("Timed out waiting for channel cards. The site might be blocking the request.");
+        }
 
         const channels = await page.evaluate((baseUrl) => {
-            // Target elements that trigger the 'play' function seen in the UI
+            // Target the specific cards shown in your screenshot
             const cards = Array.from(document.querySelectorAll('[onclick*="play"]'));
             
             const results = cards.map((el) => {
@@ -37,11 +53,10 @@ async function fetchLiveChannels() {
                 const img = el.querySelector('img')?.src || null;
                 const onclick = el.getAttribute('onclick') || "";
 
-                // Filter out non-channel items like "Contact Us" or "Support"
-                const isJunk = /Contact|Support|Version|Close|Discord|Telegram|Update/i.test(name);
+                // Filter out UI elements that aren't actual channels
+                const isJunk = /Contact|Support|Version|Close|Discord|Telegram|Update|v1\./i.test(name);
                 if (isJunk || name.length < 2) return null;
 
-                // Extract the unique slug from the play('slug') attribute
                 const match = onclick.match(/play\(['"]([^'"]+)['"]\)/);
                 const slug = match ? match[1] : null;
 
@@ -56,13 +71,17 @@ async function fetchLiveChannels() {
                 };
             }).filter(Boolean);
 
-            // Deduplicate by name to keep the list clean
             return Array.from(new Map(results.map(c => [c.name, c])).values());
         }, TARGET_SITE);
 
+        if (channels.length === 0) {
+            console.log("Warning: Scraper returned 0 channels.");
+            return cachedChannels || [];
+        }
+
         const finalChannels = channels.map((c, i) => ({ id: String(i + 1), ...c }));
         
-        console.log(`Successfully indexed ${finalChannels.length} clean channels.`);
+        console.log(`Successfully indexed ${finalChannels.length} channels.`);
         cachedChannels = finalChannels;
         lastFetchTime = Date.now();
         return finalChannels;
@@ -93,7 +112,6 @@ app.get('/resolve', async (req, res) => {
         const page = await context.newPage();
         let streamData = { videoUrl: null, licenseUrl: null };
 
-        // Listener for the HLS/DASH manifest and DRM license URLs
         page.on('request', r => {
             const u = r.url();
             if ((u.includes('.m3u8') || u.includes('.mpd')) && !u.includes('chunk') && !u.includes('segment')) {
@@ -106,22 +124,18 @@ app.get('/resolve', async (req, res) => {
 
         await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
 
-        // Handle the "Select Stream" popup seen in screenshots
+        // Handle the stream selection popup
         try {
-            // Attempt to click the first available stream option in the modal
-            const streamButton = await page.waitForSelector('button, .stream-option, [role="button"]', { timeout: 5000 });
+            const streamButton = await page.waitForSelector('button, .stream-option, [role="button"]', { timeout: 8000 });
             if (streamButton) {
                 await streamButton.click();
-                console.log("Clicked stream option in popup...");
             }
         } catch (err) {
-            console.log("No selection popup appeared, continuing...");
+            // Popup might not appear for every channel
         }
 
-        // Wait for the player to initialize and perform the DRM handshake
+        // Give it time to capture the network requests
         await new Promise(r => setTimeout(r, 12000)); 
-        
-        console.log(`Resolved: ${streamData.videoUrl ? 'Success' : 'Failed'}`);
         res.json(streamData);
     } catch (e) {
         res.status(500).json({ error: e.message });
