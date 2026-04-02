@@ -2,11 +2,10 @@ const express = require('express');
 const { chromium } = require('playwright');
 const app = express();
 
-// Use the door Railway gives us
-const port = process.env.PORT || 3000;
+// Updated to 8080 to match the new Railway Variable
+const port = process.env.PORT || 8080;
 
 // 1. SIMPLE AWAKE TEST
-// This lets us see if the station is on without using the heavy browser
 app.get('/', (req, res) => {
     res.send("ACtv Station is Awake and Online!");
 });
@@ -54,6 +53,7 @@ app.get('/resolve', async (req, res) => {
     }
 });
 
+// Final fix: Binding to 0.0.0.0 on port 8080
 app.listen(port, "0.0.0.0", () => {
-    console.log(`LIVE on port ${port}`);
+    console.log(`ACtv Station is Awake and Online on port ${port}`);
 });
