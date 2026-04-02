@@ -1,13 +1,16 @@
 {
   "name": "actv-proxy",
   "version": "1.0.0",
-  "description": "DRM Resolver for ACtv",
+  "description": "Scraper and Proxy for ACtv Android TV",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "npx playwright install chromium --with-deps && node index.js"
   },
   "dependencies": {
     "express": "^4.18.2",
     "playwright": "^1.40.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
