@@ -3,86 +3,100 @@ const { chromium } = require('playwright');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// --- ENDPOINT 1: GET CHANNEL LIST ---
+// This populates your Android TV grid with names and logos
+app.get('/channels', async (req, res) => {
+    let browser;
+    try {
+        browser = await chromium.launch({ args: ['--no-sandbox'] });
+        const context = await browser.newContext();
+        const page = await context.newPage();
+        
+        await page.goto('https://iyadtv.pages.dev/', { waitUntil: 'networkidle' });
+
+        const channels = await page.evaluate(() => {
+            const items = Array.from(document.querySelectorAll('a[href*="/play/"]'));
+            return items.map((item, index) => {
+                const name = item.querySelector('h3')?.innerText || "Unknown";
+                const logo = item.querySelector('img')?.src || "";
+                const slug = item.getAttribute('href').split('/').pop();
+                return {
+                    id: (index + 1).toString(),
+                    name: name,
+                    logoUrl: logo,
+                    category: "LIVE",
+                    websiteUrl: `https://iyadtv.pages.dev/play/${slug}`,
+                    directUrl: null // We resolve this later via /resolve
+                };
+            });
+        });
+
+        res.json(channels);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    } finally {
+        if (browser) await browser.close();
+    }
+});
+
+// --- ENDPOINT 2: RESOLVE SPECIFIC STREAM ---
+// This handles the "Source Selection" box and returns the actual video link
 app.get('/resolve', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).json({ error: "Missing URL parameter" });
 
     let browser;
     try {
-        // 1. Launch browser with specific flags to avoid detection
-        browser = await chromium.launch({ 
-            args: ['--no-sandbox', '--disable-setuid-sandbox'] 
-        });
-        
+        browser = await chromium.launch({ args: ['--no-sandbox'] });
         const context = await browser.newContext({
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         });
 
-        // KILL POPUPS: If the site tries to open a new tab/window, close it instantly
-        context.on('page', async popup => {
-            await popup.close();
-        });
+        // Auto-close any ad popups
+        context.on('page', async popup => { await popup.close(); });
 
         const page = await context.newPage();
-        let finalStream = { videoUrl: null, licenseUrl: null };
+        let finalStream = { videoUrl: null };
 
-        // 2. Network Listener: Capture the .mpd or .m3u8 link as it flies by
+        // Catch the .mpd link when it appears in the network
         page.on('request', request => {
             const url = request.url();
-            if (url.includes('.mpd') || url.includes('.m3u8')) {
-                // Ignore small segments/chunks, we want the main manifest
-                if (!url.includes('chunk') && !url.includes('fragment') && !url.includes('segment')) {
-                    finalStream.videoUrl = url;
-                }
-            }
-            // Capture Widevine DRM license URL if it exists
-            if (url.includes('widevine') || url.includes('license')) {
-                finalStream.licenseUrl = url;
+            if ((url.includes('.mpd') || url.includes('.m3u8')) && !url.includes('chunk')) {
+                finalStream.videoUrl = url;
             }
         });
 
-        // 3. Navigate to the channel page
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
 
-        // 4. THE FIX: Handle the "Source Selection" box
+        // THE FIX: Click the button in that "Select Stream" box
         try {
-            // Wait for the box to appear (give it 5 seconds max)
             const selectionBox = '#source-selection-box';
             await page.waitForSelector(selectionBox, { timeout: 5000 });
-
-            // Find all buttons inside the list that ARE NOT the 'Close' button
-            // CSS: Select buttons that do NOT have the class 'cancel_btn'
-            const buttons = await page.locator('#source-buttons-list button:not(.cancel_btn)');
             
-            if ((await buttons.count()) > 0) {
-                console.log("Source selection found. Clicking the first stream...");
-                // Click the first button (Stream 1)
+            // Target the buttons that aren't the "Close" button
+            const buttons = page.locator('#source-buttons-list button:not(.cancel_btn)');
+            if (await buttons.count() > 0) {
                 await buttons.first().click();
             }
         } catch (e) {
-            console.log("No selection box appeared, checking network logs directly...");
+            console.log("No selection box found, checking logs directly...");
         }
 
-        // 5. Wait for the player to initialize after the click
-        await page.waitForTimeout(6000); 
+        // Wait for the stream to initialize
+        await page.waitForTimeout(6000);
 
         if (finalStream.videoUrl) {
-            res.json({
-                success: true,
-                ...finalStream
-            });
+            res.json({ success: true, videoUrl: finalStream.videoUrl });
         } else {
-            res.status(404).json({ success: false, error: "Manifest URL not found after selection." });
+            res.status(404).json({ success: false, error: "Stream not found" });
         }
-
     } catch (error) {
-        console.error("Scraper Error:", error.message);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ error: error.message });
     } finally {
         if (browser) await browser.close();
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`Resolver running on port ${PORT}`);
+    console.log(`Server running on port ${PORT}`);
 });
