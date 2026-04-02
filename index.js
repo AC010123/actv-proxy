@@ -56,45 +56,73 @@ app.get('/resolve', async (req, res) => {
 
     let browser;
     try {
-        console.log(`Sniffing: ${targetUrl}`);
+        console.log(`Starting Multi-Step Sniff for: ${targetUrl}`);
         browser = await chromium.launch(launchOptions);
         
-        // FIX: UserAgent must be set during newPage creation in Playwright
         const page = await browser.newPage({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36',
+            viewport: { width: 1280, height: 720 }
         });
 
         let foundUrl = null;
 
-        // Start sniffing immediately
+        // Sniffer is active throughout the session
         page.on('response', response => {
             const url = response.url();
             if (url.includes('.m3u8') || url.includes('.mpd')) {
-                foundUrl = url;
+                // Filter out common analytics/ad tracking m3u8s if they exist
+                if (!url.includes('analytics') && !url.includes('telemetry')) {
+                    foundUrl = url;
+                }
             }
         });
 
-        // Navigate to the watch page
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-        
-        // Wait 2 seconds for the site to stabilize before clicking
-        await new Promise(r => setTimeout(r, 2000));
-        
-        // Force a click to trigger auto-play (bypasses browser autoplay restrictions)
-        await page.mouse.click(400, 300); 
-        console.log("Simulated click to trigger stream...");
+        // STEP 1: Load the initial watch page
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await new Promise(r => setTimeout(r, 3000));
 
-        // Wait up to 15 seconds for the sniffer to catch the link
-        for (let i = 0; i < 15; i++) {
+        // STEP 2: Trigger the Popup
+        // We click the center where the "Watch" or "Play" button usually sits
+        console.log("Triggering channel popup...");
+        await page.mouse.click(640, 360); 
+        await new Promise(r => setTimeout(r, 2500));
+
+        // STEP 3: Select the 1st Stream Option
+        // We look for "Server 1", "Stream 1", or simply buttons containing "1"
+        const clickResult = await page.evaluate(() => {
+            const elements = Array.from(document.querySelectorAll('button, a, li, span'));
+            const firstStream = elements.find(el => {
+                const text = el.innerText.toLowerCase();
+                return (text.includes('server 1') || text.includes('stream 1') || text === '1');
+            });
+
+            if (firstStream) {
+                firstStream.click();
+                return "Clicked Stream 1";
+            }
+            return "No specific stream button found";
+        });
+        
+        console.log(`Selection Step: ${clickResult}`);
+
+        // STEP 4: Final wait for the sniffer to catch the hidden link
+        // We give it up to 20 seconds because of the multi-click nature
+        for (let i = 0; i < 20; i++) {
             if (foundUrl) break;
+            
+            // Emergency click at the 7-second mark if nothing is happening
+            if (i === 7) {
+                console.log("Sending emergency interaction click...");
+                await page.mouse.click(640, 360);
+            }
             await new Promise(r => setTimeout(r, 1000));
         }
 
         if (foundUrl) {
-            console.log(`Stream caught: ${foundUrl}`);
+            console.log(`Success! Stream caught: ${foundUrl}`);
             res.json({ success: true, url: foundUrl });
         } else {
-            throw new Error("Could not find a valid stream link on this page.");
+            throw new Error("Could not find a valid stream link after navigating the popup.");
         }
 
     } catch (error) {
@@ -105,4 +133,4 @@ app.get('/resolve', async (req, res) => {
     }
 });
 
-app.listen(PORT, () => console.log(`ACtv Backend Active on Port ${PORT}`));
+app.listen(PORT, () => console.log(`ACtv Backend (Multi-Step Mode) Active on Port ${PORT}`));
