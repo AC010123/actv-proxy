@@ -25,37 +25,49 @@ async function fetchLiveChannels() {
         });
         const page = await context.newPage();
         
+        // Speed up scraping by ignoring heavy assets
         await page.route('**/*.{png,jpg,jpeg,css,svg,woff}', route => route.abort());
         await page.goto(TARGET_SITE, { waitUntil: 'networkidle', timeout: 60000 });
 
         const channels = await page.evaluate((baseUrl) => {
-            const elements = Array.from(document.querySelectorAll('a, [onclick], .grid-item'));
+            // 1. Target all potential interactive elements
+            const elements = Array.from(document.querySelectorAll('a, [onclick], .grid-item, div.card'));
             
-            const filtered = elements.map((el) => {
-                const name = el.innerText.trim();
+            const results = elements.map((el) => {
+                const name = el.innerText?.trim() || "";
                 const img = el.querySelector('img')?.src || null;
-                const onclick = el.getAttribute('onclick') || "";
+                
+                // 2. Logic fix: Check self OR parent for the onclick attribute
+                const onclick = el.getAttribute('onclick') || el.parentElement?.getAttribute('onclick') || "";
 
+                // 3. Junk filter: Remove support tiles and versioning
                 const isJunk = /Contact|Support|Version|Close|Discord|Telegram|Update|v1\./i.test(name);
-                if (isJunk || !name || name.length < 2) return null;
+                if (isJunk || name.length < 2) return null;
 
-                const match = onclick.match(/'([^']+)'/);
+                // 4. Extraction fix: Specifically look for the play('slug') pattern
+                const match = onclick.match(/play\(['"]([^'"]+)['"]\)/);
                 const slug = match ? match[1] : null;
+
+                // If no slug found, it's not a playable channel tile
+                if (!slug) return null;
 
                 return {
                     name: name,
                     logoUrl: img,
                     category: "LIVE",
-                    websiteUrl: slug ? `${baseUrl}play/${slug}` : null
+                    websiteUrl: `${baseUrl}play/${slug}`,
+                    directUrl: null
                 };
-            }).filter(item => item !== null && item.websiteUrl !== null);
+            }).filter(item => item !== null);
 
-            return Array.from(new Map(filtered.map(c => [c.name, c])).values());
+            // Deduplicate by name
+            return Array.from(new Map(results.map(c => [c.name, c])).values());
         }, TARGET_SITE);
 
+        // Re-assign sequential IDs to keep the TV list clean
         const finalChannels = channels.map((c, i) => ({ id: String(i + 1), ...c }));
-        console.log(`Successfully indexed ${finalChannels.length} clean channels.`);
         
+        console.log(`Successfully indexed ${finalChannels.length} clean channels.`);
         cachedChannels = finalChannels;
         lastFetchTime = Date.now();
         return finalChannels;
@@ -79,7 +91,6 @@ app.get('/resolve', async (req, res) => {
     
     let browser;
     try {
-        // Use a realistic user agent to prevent being blocked by the player provider
         browser = await chromium.launch({ args: ['--no-sandbox'] });
         const context = await browser.newContext({
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
@@ -88,17 +99,16 @@ app.get('/resolve', async (req, res) => {
         
         let streamData = { videoUrl: null, licenseUrl: null };
 
-        // IMPROVED LISTENER: Prioritize Master Playlists and block segments
+        // Optimized listener for Master Playlists and DRM
         page.on('request', r => {
             const u = r.url();
             
-            // Look for HLS (.m3u8) or DASH (.mpd)
-            // We exclude 'chunk' or 'segment' to ensure we get the main stream URL
+            // Prioritize main playlists; exclude short-lived segments/chunks
             if ((u.includes('.m3u8') || u.includes('.mpd')) && !u.includes('chunk') && !u.includes('segment')) {
                 streamData.videoUrl = u;
             }
 
-            // Look for DRM Licenses (Widevine/ClearKey)
+            // Identify DRM license handshakes
             if (u.includes('widevine') || u.includes('license') || u.includes('clearkey') || u.includes('drm')) {
                 streamData.licenseUrl = u;
             }
@@ -106,7 +116,7 @@ app.get('/resolve', async (req, res) => {
 
         await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
         
-        // Wait longer for the video player to perform the DRM handshake
+        // Wait for player initialization and network requests to fire
         await new Promise(r => setTimeout(r, 12000)); 
         
         console.log(`Resolved: ${streamData.videoUrl ? 'Success' : 'Failed'}`);
