@@ -4,61 +4,37 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const launchOptions = {
-    args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--single-process',
-        '--disable-gpu'
-    ]
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--single-process']
 };
 
-// --- ENDPOINT 1: GET CHANNEL LIST (With URL Encoding Fix) ---
 app.get('/channels', async (req, res) => {
     let browser;
     try {
         browser = await chromium.launch(launchOptions);
         const page = await browser.newPage();
-
-        await page.route('**/*', (route) => {
-            const type = route.request().resourceType();
-            if (['image', 'font', 'stylesheet'].includes(type)) return route.abort();
-            route.continue();
-        });
-
         await page.goto('https://iyadtv.pages.dev/', { waitUntil: 'domcontentloaded', timeout: 60000 });
         await page.waitForSelector('.channel-card', { timeout: 20000 });
 
         const channels = await page.evaluate(() => {
-            const cards = Array.from(document.querySelectorAll('.channel-card'));
-            return cards.map((card, index) => {
+            return Array.from(document.querySelectorAll('.channel-card')).map((card, index) => {
                 const name = card.getAttribute('aria-label') || "Unknown";
                 const logo = card.querySelector('.channel-card-logo')?.src || "";
-                
-                // THE FIX: Use encodeURIComponent to handle spaces as %20
-                // This ensures "ABC Australia" becomes "ABC%20Australia"
-                const slug = encodeURIComponent(name);
-                
                 return {
                     id: (index + 1).toString(),
                     name: name,
                     logoUrl: logo,
-                    websiteUrl: `https://iyadtv.pages.dev/watch?v=${slug}`
+                    websiteUrl: `https://iyadtv.pages.dev/watch?v=${encodeURIComponent(name)}`
                 };
             });
         });
-
-        console.log(`Success: Found ${channels.length} channels.`);
         res.json(channels);
     } catch (error) {
-        console.error("List Scrape Failed:", error.message);
-        res.status(500).json({ error: "Failed to load channel grid." });
+        res.status(500).json({ error: error.message });
     } finally {
         if (browser) await browser.close();
     }
 });
 
-// --- ENDPOINT 2: RESOLVE STREAM (Verified 3RSTV Flow) ---
 app.get('/resolve', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send("No URL provided");
@@ -70,44 +46,66 @@ app.get('/resolve', async (req, res) => {
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         });
         const page = await context.newPage();
-        
         let result = { videoUrl: null, licenseUrl: null };
 
         page.on('request', req => {
             const url = req.url();
-            if ((url.includes('.mpd') || url.includes('.m3u8')) && !url.includes('chunk')) {
-                result.videoUrl = url;
-            }
-            if (url.includes('widevine') || url.includes('license')) {
-                result.licenseUrl = url;
-            }
+            if ((url.includes('.mpd') || url.includes('.m3u8')) && !url.includes('chunk')) result.videoUrl = url;
+            if (url.includes('widevine') || url.includes('license')) result.licenseUrl = url;
         });
 
-        // Use 'networkidle' here to ensure the JS player scripts are fully ready
+        console.log(`Navigating to: ${targetUrl}`);
         await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 30000 });
 
-        // STEP 1: Click the player
-        try {
-            const playerSelector = '#shaka-player-wrapper, #hls-player-wrapper, #video-player-container';
-            await page.waitForSelector(playerSelector, { timeout: 5000 });
-            await page.click(playerSelector);
-        } catch (e) {
-            console.log("Player click skipped.");
+        // FIX 1: Try multiple possible player triggers
+        const triggerSelectors = [
+            '#shaka-player-wrapper', 
+            '#hls-player-wrapper', 
+            '.vjs-big-play-button', 
+            '#video-player-container',
+            '.channel-player-container' // Added a generic one
+        ];
+
+        for (const selector of triggerSelectors) {
+            try {
+                if (await page.isVisible(selector)) {
+                    await page.click(selector);
+                    console.log(`Clicked trigger: ${selector}`);
+                    break; 
+                }
+            } catch (e) {}
         }
 
-        // STEP 2: Click "Stream 1"
-        try {
-            const btnSelector = '#source-buttons-list button:not(.cancel_btn)';
-            await page.waitForSelector(btnSelector, { timeout: 8000 });
-            await page.click(btnSelector);
-        } catch (e) {
-            console.log("Source box didn't appear.");
+        // FIX 2: More flexible "Stream" button selection
+        // Some channels might use "Stream 1", others just "Server 1"
+        const sourceBtnSelectors = [
+            '#source-buttons-list button:not(.cancel_btn)',
+            '.source-btn',
+            'button:has-text("Stream")',
+            'button:has-text("Server")'
+        ];
+
+        let sourceClicked = false;
+        for (let i = 0; i < 5; i++) { // Retry loop
+            for (const selector of sourceBtnSelectors) {
+                try {
+                    const btn = page.locator(selector).first();
+                    if (await btn.isVisible()) {
+                        await btn.click();
+                        console.log(`Clicked source button using: ${selector}`);
+                        sourceClicked = true;
+                        break;
+                    }
+                } catch (e) {}
+            }
+            if (sourceClicked || result.videoUrl) break;
+            await page.waitForTimeout(1000); // Wait 1s between retries
         }
 
-        // STEP 3: Wait for the link capture
+        // Final wait for network capture
         let attempts = 0;
         while (!result.videoUrl && attempts < 20) {
-            await new Promise(r => setTimeout(r, 500));
+            await page.waitForTimeout(500);
             attempts++;
         }
 
@@ -119,7 +117,7 @@ app.get('/resolve', async (req, res) => {
                 isDRM: !!result.licenseUrl
             });
         } else {
-            res.status(404).json({ success: false, error: "Stream link not captured." });
+            res.status(404).json({ success: false, error: "Stream capture timed out." });
         }
 
     } catch (error) {
@@ -129,4 +127,4 @@ app.get('/resolve', async (req, res) => {
     }
 });
 
-app.listen(PORT, () => console.log(`ACtv Backend Active on Port ${PORT}`));
+app.listen(PORT, () => console.log(`Resolver running on ${PORT}`));
