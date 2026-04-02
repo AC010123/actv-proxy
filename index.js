@@ -1,145 +1,88 @@
 const express = require('express');
 const { chromium } = require('playwright');
 const app = express();
-
-const port = process.env.PORT || 8080;
-const TARGET_SITE = "https://iyadtv.pages.dev/";
-
-let cachedChannels = null;
-let lastFetchTime = 0;
-const CACHE_DURATION = 15 * 60 * 1000; 
-
-async function fetchLiveChannels() {
-    if (cachedChannels && (Date.now() - lastFetchTime < CACHE_DURATION)) {
-        return cachedChannels;
-    }
-
-    console.log("--- Refreshing ACtv Channel List ---");
-    let browser;
-    try {
-        browser = await chromium.launch({ 
-            args: [
-                '--no-sandbox', 
-                '--disable-setuid-sandbox', 
-                '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled'
-            ] 
-        });
-        
-        const context = await browser.newContext({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            viewport: { width: 1280, height: 800 }
-        });
-
-        const page = await context.newPage();
-        await page.goto(TARGET_SITE, { waitUntil: 'networkidle', timeout: 60000 });
-
-        // NEW SELECTOR: Wait for the specific class seen in your HTML snippet
-        try {
-            await page.waitForSelector('.channel-card', { timeout: 15000 });
-        } catch (e) {
-            console.log("Could not find .channel-card. Site might be slow or layout changed.");
-        }
-
-        const channels = await page.evaluate((baseUrl) => {
-            // Select all elements with the 'channel-card' class
-            const cards = Array.from(document.querySelectorAll('.channel-card'));
-            
-            return cards.map((el) => {
-                // The name is now stored in 'aria-label' or the inner div
-                const name = el.getAttribute('aria-label') || el.innerText?.trim();
-                const img = el.querySelector('img')?.src || null;
-                
-                // We generate the slug from the name to match the site's URL structure
-                // Usually names like "ABC Australia" become "abc-australia"
-                const slug = name.toLowerCase()
-                                 .replace(/[^a-z0-9]+/g, '-')
-                                 .replace(/(^-|-$)/g, '');
-
-                if (!name || name.length < 2) return null;
-
-                return {
-                    name: name,
-                    logoUrl: img,
-                    category: "LIVE",
-                    websiteUrl: `${baseUrl}play/${slug}`,
-                    directUrl: null
-                };
-            }).filter(Boolean);
-        }, TARGET_SITE);
-
-        if (channels.length === 0) {
-            console.log("Scraper found 0 channels. Check selectors.");
-            return cachedChannels || [];
-        }
-
-        const finalChannels = channels.map((c, i) => ({ id: String(i + 1), ...c }));
-        
-        console.log(`Successfully indexed ${finalChannels.length} channels.`);
-        cachedChannels = finalChannels;
-        lastFetchTime = Date.now();
-        return finalChannels;
-
-    } catch (e) {
-        console.error("Scrape Error:", e.message);
-        return cachedChannels || [];
-    } finally {
-        if (browser) await browser.close();
-    }
-}
-
-app.get('/channels', async (req, res) => {
-    const list = await fetchLiveChannels();
-    res.json(list);
-});
+const PORT = process.env.PORT || 3000;
 
 app.get('/resolve', async (req, res) => {
-    const url = req.query.url;
-    if (!url || url === "null") return res.status(400).json({ error: "Invalid URL" });
-    
+    const targetUrl = req.query.url;
+    if (!targetUrl) return res.status(400).json({ error: "Missing URL parameter" });
+
     let browser;
     try {
-        browser = await chromium.launch({ args: ['--no-sandbox'] });
+        // 1. Launch browser with specific flags to avoid detection
+        browser = await chromium.launch({ 
+            args: ['--no-sandbox', '--disable-setuid-sandbox'] 
+        });
+        
         const context = await browser.newContext({
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         });
-        const page = await context.newPage();
-        let streamData = { videoUrl: null, licenseUrl: null };
 
-        page.on('request', r => {
-            const u = r.url();
-            if ((u.includes('.m3u8') || u.includes('.mpd')) && !u.includes('chunk')) {
-                streamData.videoUrl = u;
+        // KILL POPUPS: If the site tries to open a new tab/window, close it instantly
+        context.on('page', async popup => {
+            await popup.close();
+        });
+
+        const page = await context.newPage();
+        let finalStream = { videoUrl: null, licenseUrl: null };
+
+        // 2. Network Listener: Capture the .mpd or .m3u8 link as it flies by
+        page.on('request', request => {
+            const url = request.url();
+            if (url.includes('.mpd') || url.includes('.m3u8')) {
+                // Ignore small segments/chunks, we want the main manifest
+                if (!url.includes('chunk') && !url.includes('fragment') && !url.includes('segment')) {
+                    finalStream.videoUrl = url;
+                }
             }
-            if (u.includes('widevine') || u.includes('license') || u.includes('clearkey')) {
-                streamData.licenseUrl = u;
+            // Capture Widevine DRM license URL if it exists
+            if (url.includes('widevine') || url.includes('license')) {
+                finalStream.licenseUrl = url;
             }
         });
 
-        await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
+        // 3. Navigate to the channel page
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        // Handle the popup button
+        // 4. THE FIX: Handle the "Source Selection" box
         try {
-            // Target the pink/red buttons seen in your screenshot
-            const streamButton = await page.waitForSelector('button:has-text("TV5"), .stream-option, [role="button"]', { timeout: 10000 });
-            if (streamButton) {
-                await streamButton.click();
+            // Wait for the box to appear (give it 5 seconds max)
+            const selectionBox = '#source-selection-box';
+            await page.waitForSelector(selectionBox, { timeout: 5000 });
+
+            // Find all buttons inside the list that ARE NOT the 'Close' button
+            // CSS: Select buttons that do NOT have the class 'cancel_btn'
+            const buttons = await page.locator('#source-buttons-list button:not(.cancel_btn)');
+            
+            if ((await buttons.count()) > 0) {
+                console.log("Source selection found. Clicking the first stream...");
+                // Click the first button (Stream 1)
+                await buttons.first().click();
             }
-        } catch (err) {
-            console.log("No popup or click failed, waiting for auto-load...");
+        } catch (e) {
+            console.log("No selection box appeared, checking network logs directly...");
         }
 
-        await new Promise(r => setTimeout(r, 12000)); 
-        res.json(streamData);
-    } catch (e) {
-        res.status(500).json({ error: e.message });
+        // 5. Wait for the player to initialize after the click
+        await page.waitForTimeout(6000); 
+
+        if (finalStream.videoUrl) {
+            res.json({
+                success: true,
+                ...finalStream
+            });
+        } else {
+            res.status(404).json({ success: false, error: "Manifest URL not found after selection." });
+        }
+
+    } catch (error) {
+        console.error("Scraper Error:", error.message);
+        res.status(500).json({ success: false, error: error.message });
     } finally {
         if (browser) await browser.close();
     }
 });
 
-app.get('/', (req, res) => res.send("ACtv Backend: Online"));
-
-app.listen(port, "0.0.0.0", () => {
-    console.log(`ACtv Server running on port ${port}`);
+app.listen(PORT, () => {
+    console.log(`Resolver running on port ${PORT}`);
 });
