@@ -12,11 +12,55 @@ const launchOptions = {
         '--single-process',
         '--disable-gpu',
         '--no-zygote',
-        '--disable-blink-features=AutomationControlled'
+        '--disable-blink-features=AutomationControlled' // Hides bot status
     ]
 };
 
-// --- ADAPTIVE RESOLVER ---
+// Optimization for Channel List fetching
+async function setupPageOptimizations(page) {
+    await page.route('**/*', (route) => {
+        const type = route.request().resourceType();
+        // Block heavy assets to save Railway RAM and speed up the list load
+        if (['image', 'font', 'stylesheet', 'media'].includes(type)) return route.abort();
+        route.continue();
+    });
+}
+
+// --- ENDPOINT 1: GET CHANNEL LIST (Restored) ---
+app.get('/channels', async (req, res) => {
+    let browser;
+    try {
+        browser = await chromium.launch(launchOptions);
+        const page = await browser.newPage();
+        await setupPageOptimizations(page);
+
+        // Wait for the main site to load its channel cards
+        await page.goto('https://iyadtv.pages.dev/', { waitUntil: 'networkidle', timeout: 60000 });
+        await page.waitForSelector('.channel-card', { timeout: 15000 });
+
+        const channels = await page.evaluate(() => {
+            return Array.from(document.querySelectorAll('.channel-card')).map((card, index) => {
+                const name = card.getAttribute('aria-label') || "Unknown";
+                return {
+                    id: (index + 1).toString(),
+                    name: name,
+                    logoUrl: card.querySelector('.channel-card-logo')?.src || "",
+                    websiteUrl: `https://iyadtv.pages.dev/watch?v=${encodeURIComponent(name)}`
+                };
+            });
+        });
+        
+        console.log(`Fetched ${channels.length} channels.`);
+        res.json(channels);
+    } catch (error) {
+        console.error("List Error:", error.message);
+        res.status(500).json({ error: error.message });
+    } finally {
+        if (browser) await browser.close();
+    }
+});
+
+// --- ENDPOINT 2: ADAPTIVE RESOLVER ---
 app.get('/resolve', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send("No URL provided");
@@ -25,8 +69,6 @@ app.get('/resolve', async (req, res) => {
     try {
         browser = await chromium.launch(launchOptions);
         
-        // ADAPTIVE STEP 1: Rotate User-Agents
-        // Some sites like 3RSTV often respond better to Mobile headers
         const isMobileRequest = targetUrl.includes('3RSTV');
         const context = await browser.newContext({
             userAgent: isMobileRequest 
@@ -36,6 +78,8 @@ app.get('/resolve', async (req, res) => {
         });
 
         const page = await context.newPage();
+        
+        // Stealth: Hide Playwright from bot-detectors
         await page.addInitScript(() => {
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         });
@@ -46,12 +90,11 @@ app.get('/resolve', async (req, res) => {
             capturedHeaders: { "Referer": "https://iyadtv.pages.dev/", "Origin": "https://iyadtv.pages.dev" }
         };
 
-        // ADAPTIVE STEP 2: Event-Based Header Capture
+        // Capture manifests and their dynamic headers
         page.on('request', request => {
             const url = request.url();
             if ((url.includes('.mpd') || url.includes('.m3u8') || url.includes('manifest')) && !url.includes('chunk')) {
                 result.videoUrl = url;
-                // Dynamically steal the headers used by the actual site
                 const headers = request.headers();
                 if (headers['referer']) result.capturedHeaders['Referer'] = headers['referer'];
                 if (headers['authorization']) result.capturedHeaders['Authorization'] = headers['authorization'];
@@ -59,14 +102,13 @@ app.get('/resolve', async (req, res) => {
             if (url.includes('widevine') || url.includes('license')) result.licenseUrl = url;
         });
 
+        console.log(`Resolving: ${targetUrl}`);
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-        // ADAPTIVE STEP 3: Multi-Stage Interaction
-        // Attempt Stage 1: Center Click
+        // Trigger the player with a physical click
         await page.mouse.click(isMobileRequest ? 180 : 640, isMobileRequest ? 400 : 360);
         await page.waitForTimeout(2000);
 
-        // Attempt Stage 2: Hunt for common player buttons if URL still missing
         if (!result.videoUrl) {
             const selectors = ['video', '.vjs-big-play-button', 'button[aria-label="Play"]', '.play-button'];
             for (const s of selectors) {
@@ -75,7 +117,6 @@ app.get('/resolve', async (req, res) => {
             }
         }
 
-        // ADAPTIVE STEP 4: Extended Polling for "Lazy" streams
         let attempts = 0;
         while (!result.videoUrl && attempts < 40) {
             await page.waitForTimeout(500);
@@ -91,7 +132,6 @@ app.get('/resolve', async (req, res) => {
                 headers: result.capturedHeaders
             });
         } else {
-            // Provide specific feedback for debugging
             res.status(404).json({ 
                 success: false, 
                 error: "Adaptive capture failed. Site likely using advanced bot-shield or Geo-blocking." 
