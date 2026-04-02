@@ -7,7 +7,7 @@ const TARGET_SITE = "https://iyadtv.pages.dev/";
 
 let cachedChannels = null;
 let lastFetchTime = 0;
-const CACHE_DURATION = 10 * 60 * 1000; 
+const CACHE_DURATION = 15 * 60 * 1000; 
 
 async function fetchLiveChannels() {
     if (cachedChannels && (Date.now() - lastFetchTime < CACHE_DURATION)) {
@@ -17,7 +17,6 @@ async function fetchLiveChannels() {
     console.log("--- Refreshing ACtv Channel List ---");
     let browser;
     try {
-        // STEALTH: Added more flags to bypass bot detection on Railway
         browser = await chromium.launch({ 
             args: [
                 '--no-sandbox', 
@@ -29,38 +28,35 @@ async function fetchLiveChannels() {
         
         const context = await browser.newContext({
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            viewport: { width: 1280, height: 720 }
+            viewport: { width: 1280, height: 800 }
         });
 
         const page = await context.newPage();
-        
-        // Go to site and wait for the actual grid to load
-        await page.goto(TARGET_SITE, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        
-        // WAIT: Specifically wait for the channel cards to appear in the DOM
+        await page.goto(TARGET_SITE, { waitUntil: 'networkidle', timeout: 60000 });
+
+        // NEW SELECTOR: Wait for the specific class seen in your HTML snippet
         try {
-            await page.waitForSelector('[onclick*="play"]', { timeout: 15000 });
+            await page.waitForSelector('.channel-card', { timeout: 15000 });
         } catch (e) {
-            console.log("Timed out waiting for channel cards. The site might be blocking the request.");
+            console.log("Could not find .channel-card. Site might be slow or layout changed.");
         }
 
         const channels = await page.evaluate((baseUrl) => {
-            // Target the specific cards shown in your screenshot
-            const cards = Array.from(document.querySelectorAll('[onclick*="play"]'));
+            // Select all elements with the 'channel-card' class
+            const cards = Array.from(document.querySelectorAll('.channel-card'));
             
-            const results = cards.map((el) => {
-                const name = el.innerText?.trim() || "";
+            return cards.map((el) => {
+                // The name is now stored in 'aria-label' or the inner div
+                const name = el.getAttribute('aria-label') || el.innerText?.trim();
                 const img = el.querySelector('img')?.src || null;
-                const onclick = el.getAttribute('onclick') || "";
+                
+                // We generate the slug from the name to match the site's URL structure
+                // Usually names like "ABC Australia" become "abc-australia"
+                const slug = name.toLowerCase()
+                                 .replace(/[^a-z0-9]+/g, '-')
+                                 .replace(/(^-|-$)/g, '');
 
-                // Filter out UI elements that aren't actual channels
-                const isJunk = /Contact|Support|Version|Close|Discord|Telegram|Update|v1\./i.test(name);
-                if (isJunk || name.length < 2) return null;
-
-                const match = onclick.match(/play\(['"]([^'"]+)['"]\)/);
-                const slug = match ? match[1] : null;
-
-                if (!slug) return null;
+                if (!name || name.length < 2) return null;
 
                 return {
                     name: name,
@@ -70,12 +66,10 @@ async function fetchLiveChannels() {
                     directUrl: null
                 };
             }).filter(Boolean);
-
-            return Array.from(new Map(results.map(c => [c.name, c])).values());
         }, TARGET_SITE);
 
         if (channels.length === 0) {
-            console.log("Warning: Scraper returned 0 channels.");
+            console.log("Scraper found 0 channels. Check selectors.");
             return cachedChannels || [];
         }
 
@@ -114,27 +108,27 @@ app.get('/resolve', async (req, res) => {
 
         page.on('request', r => {
             const u = r.url();
-            if ((u.includes('.m3u8') || u.includes('.mpd')) && !u.includes('chunk') && !u.includes('segment')) {
+            if ((u.includes('.m3u8') || u.includes('.mpd')) && !u.includes('chunk')) {
                 streamData.videoUrl = u;
             }
-            if (u.includes('widevine') || u.includes('license') || u.includes('clearkey') || u.includes('drm')) {
+            if (u.includes('widevine') || u.includes('license') || u.includes('clearkey')) {
                 streamData.licenseUrl = u;
             }
         });
 
         await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
 
-        // Handle the stream selection popup
+        // Handle the popup button
         try {
-            const streamButton = await page.waitForSelector('button, .stream-option, [role="button"]', { timeout: 8000 });
+            // Target the pink/red buttons seen in your screenshot
+            const streamButton = await page.waitForSelector('button:has-text("TV5"), .stream-option, [role="button"]', { timeout: 10000 });
             if (streamButton) {
                 await streamButton.click();
             }
         } catch (err) {
-            // Popup might not appear for every channel
+            console.log("No popup or click failed, waiting for auto-load...");
         }
 
-        // Give it time to capture the network requests
         await new Promise(r => setTimeout(r, 12000)); 
         res.json(streamData);
     } catch (e) {
