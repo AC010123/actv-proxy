@@ -25,30 +25,26 @@ async function fetchLiveChannels() {
         });
         const page = await context.newPage();
         
-        // Speed up scraping by ignoring heavy assets
-        await page.route('**/*.{png,jpg,jpeg,css,svg,woff}', route => route.abort());
+        // Load the site and wait for the grid to appear
         await page.goto(TARGET_SITE, { waitUntil: 'networkidle', timeout: 60000 });
 
         const channels = await page.evaluate((baseUrl) => {
-            // 1. Target all potential interactive elements
-            const elements = Array.from(document.querySelectorAll('a, [onclick], .grid-item, div.card'));
+            // Target elements that trigger the 'play' function seen in the UI
+            const cards = Array.from(document.querySelectorAll('[onclick*="play"]'));
             
-            const results = elements.map((el) => {
+            const results = cards.map((el) => {
                 const name = el.innerText?.trim() || "";
                 const img = el.querySelector('img')?.src || null;
-                
-                // 2. Logic fix: Check self OR parent for the onclick attribute
-                const onclick = el.getAttribute('onclick') || el.parentElement?.getAttribute('onclick') || "";
+                const onclick = el.getAttribute('onclick') || "";
 
-                // 3. Junk filter: Remove support tiles and versioning
-                const isJunk = /Contact|Support|Version|Close|Discord|Telegram|Update|v1\./i.test(name);
+                // Filter out non-channel items like "Contact Us" or "Support"
+                const isJunk = /Contact|Support|Version|Close|Discord|Telegram|Update/i.test(name);
                 if (isJunk || name.length < 2) return null;
 
-                // 4. Extraction fix: Specifically look for the play('slug') pattern
+                // Extract the unique slug from the play('slug') attribute
                 const match = onclick.match(/play\(['"]([^'"]+)['"]\)/);
                 const slug = match ? match[1] : null;
 
-                // If no slug found, it's not a playable channel tile
                 if (!slug) return null;
 
                 return {
@@ -58,13 +54,12 @@ async function fetchLiveChannels() {
                     websiteUrl: `${baseUrl}play/${slug}`,
                     directUrl: null
                 };
-            }).filter(item => item !== null);
+            }).filter(Boolean);
 
-            // Deduplicate by name
+            // Deduplicate by name to keep the list clean
             return Array.from(new Map(results.map(c => [c.name, c])).values());
         }, TARGET_SITE);
 
-        // Re-assign sequential IDs to keep the TV list clean
         const finalChannels = channels.map((c, i) => ({ id: String(i + 1), ...c }));
         
         console.log(`Successfully indexed ${finalChannels.length} clean channels.`);
@@ -96,27 +91,34 @@ app.get('/resolve', async (req, res) => {
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         });
         const page = await context.newPage();
-        
         let streamData = { videoUrl: null, licenseUrl: null };
 
-        // Optimized listener for Master Playlists and DRM
+        // Listener for the HLS/DASH manifest and DRM license URLs
         page.on('request', r => {
             const u = r.url();
-            
-            // Prioritize main playlists; exclude short-lived segments/chunks
             if ((u.includes('.m3u8') || u.includes('.mpd')) && !u.includes('chunk') && !u.includes('segment')) {
                 streamData.videoUrl = u;
             }
-
-            // Identify DRM license handshakes
             if (u.includes('widevine') || u.includes('license') || u.includes('clearkey') || u.includes('drm')) {
                 streamData.licenseUrl = u;
             }
         });
 
         await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
-        
-        // Wait for player initialization and network requests to fire
+
+        // Handle the "Select Stream" popup seen in screenshots
+        try {
+            // Attempt to click the first available stream option in the modal
+            const streamButton = await page.waitForSelector('button, .stream-option, [role="button"]', { timeout: 5000 });
+            if (streamButton) {
+                await streamButton.click();
+                console.log("Clicked stream option in popup...");
+            }
+        } catch (err) {
+            console.log("No selection popup appeared, continuing...");
+        }
+
+        // Wait for the player to initialize and perform the DRM handshake
         await new Promise(r => setTimeout(r, 12000)); 
         
         console.log(`Resolved: ${streamData.videoUrl ? 'Success' : 'Failed'}`);
