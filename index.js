@@ -13,42 +13,7 @@ const launchOptions = {
     ]
 };
 
-// --- ENDPOINT 1: GET CHANNEL LIST ---
-app.get('/channels', async (req, res) => {
-    let browser;
-    try {
-        browser = await chromium.launch(launchOptions);
-        const context = await browser.newContext();
-        const page = await context.newPage();
-
-        // Block CSS/Images to save RAM during the list fetch
-        await page.route('**/*', (route) => {
-            const type = route.request().resourceType();
-            if (['image', 'font', 'stylesheet'].includes(type)) return route.abort();
-            route.continue();
-        });
-
-        await page.goto('https://iyadtv.pages.dev/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await page.waitForSelector('#channel-grid a', { timeout: 15000 });
-
-        const channels = await page.evaluate(() => {
-            return Array.from(document.querySelectorAll('#channel-grid a[href*="/play/"]')).map((item, index) => ({
-                id: (index + 1).toString(),
-                name: item.querySelector('h3')?.innerText || "Unknown",
-                logoUrl: item.querySelector('img')?.src || "",
-                websiteUrl: item.href
-            }));
-        });
-
-        res.json(channels);
-    } catch (error) {
-        res.status(500).json({ error: "Failed to load channels" });
-    } finally {
-        if (browser) await browser.close();
-    }
-});
-
-// --- ENDPOINT 2: RESOLVE STREAM (Optimized for 3RS Flow) ---
+// --- ENDPOINT: RESOLVE STREAM ---
 app.get('/resolve', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send("No URL provided");
@@ -63,7 +28,7 @@ app.get('/resolve', async (req, res) => {
         
         let result = { videoUrl: null, licenseUrl: null };
 
-        // Listen for the manifest and license in the background
+        // MONITOR: Catch the .mpd and License URLs in the background
         page.on('request', req => {
             const url = req.url();
             if ((url.includes('.mpd') || url.includes('.m3u8')) && !url.includes('chunk')) {
@@ -74,32 +39,31 @@ app.get('/resolve', async (req, res) => {
             }
         });
 
-        console.log(`Navigating to: ${targetUrl}`);
+        console.log(`Step 1: Navigating to ${targetUrl}`);
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        // STEP 1: Click the Player to trigger the popup
-        // We look for the main video container or play button
+        // STEP 1: Click the "Play" area to trigger the source selection
+        // Based on the HTML you sent, the player wrappers are the best target
         try {
-            await page.waitForSelector('#shaka-player-wrapper, #hls-player-wrapper', { timeout: 5000 });
-            await page.click('#shaka-player-wrapper, #hls-player-wrapper');
-            console.log("Initial player clicked...");
+            const playerSelector = '#shaka-player-wrapper, #hls-player-wrapper, #video-player-container';
+            await page.waitForSelector(playerSelector, { timeout: 5000 });
+            await page.click(playerSelector);
+            console.log("Step 2: Player clicked. Waiting for Source Box...");
         } catch (e) {
-            console.log("No initial player found or already active.");
+            console.log("Player click failed or not needed.");
         }
 
-        // STEP 2: Wait for the Source Selection Box and click the first stream
+        // STEP 2: Click the Stream Source (Stream 1)
         try {
             const btnSelector = '#source-buttons-list button:not(.cancel_btn)';
-            await page.waitForSelector(btnSelector, { timeout: 7000 });
-            
-            // This clicks the FIRST stream link (e.g., 3RS Stream 1)
+            await page.waitForSelector(btnSelector, { timeout: 8000 });
             await page.click(btnSelector);
-            console.log("Source stream button clicked.");
+            console.log("Step 3: Source selected!");
         } catch (e) {
-            console.log("Source selection box didn't appear. Site might be slow.");
+            console.log("Step 3: Source box never appeared.");
         }
 
-        // STEP 3: Wait for the manifest to appear in network logs
+        // STEP 4: Wait for the network to capture the link
         let attempts = 0;
         while (!result.videoUrl && attempts < 20) {
             await new Promise(r => setTimeout(r, 500));
@@ -114,7 +78,7 @@ app.get('/resolve', async (req, res) => {
                 isDRM: !!result.licenseUrl
             });
         } else {
-            res.status(404).json({ success: false, error: "Stream link not captured." });
+            res.status(404).json({ success: false, error: "Stream link not found in network logs." });
         }
 
     } catch (error) {
@@ -124,4 +88,4 @@ app.get('/resolve', async (req, res) => {
     }
 });
 
-app.listen(PORT, () => console.log(`ACtv Backend on port ${PORT}`));
+app.listen(PORT, () => console.log(`Resolver active on port ${PORT}`));
