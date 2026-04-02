@@ -7,6 +7,6 @@
   },
   "dependencies": {
     "express": "^4.18.2",
-    "playwright": "latest"
+    "playwright": "1.59.0"
   }
 }
