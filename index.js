@@ -7,63 +7,64 @@ const TARGET_SITE = "https://iyadtv.pages.dev/";
 
 let cachedChannels = null;
 let lastFetchTime = 0;
-const CACHE_DURATION = 10 * 60 * 1000; 
+const CACHE_DURATION = 15 * 60 * 1000; 
 
 async function fetchLiveChannels() {
     if (cachedChannels && (Date.now() - lastFetchTime < CACHE_DURATION)) {
         return cachedChannels;
     }
 
-    console.log("--- Scraping Channel Grid ---");
+    console.log("--- Refreshing ACtv Channel List ---");
     let browser;
     try {
         browser = await chromium.launch({ 
-            args: ['--no-sandbox', '--disable-setuid-sandbox'] 
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] 
         });
-        const page = await browser.newPage();
+        const context = await browser.newContext();
+        const page = await context.newPage();
         
-        // Go to site and wait until the network is quiet
+        // Speed up scraping by ignoring images/css during the initial scan
+        await page.route('**/*.{png,jpg,jpeg,css,svg,woff}', route => route.abort());
+        
         await page.goto(TARGET_SITE, { waitUntil: 'networkidle', timeout: 60000 });
 
-        // WAIT specifically for the grid items to appear
-        // Based on the image, we look for elements that contain text or images
-        await page.waitForSelector('img', { timeout: 15000 });
-
-        const channels = await page.evaluate(() => {
-            // We look for all elements that behave like a 'card'
-            // Usually, these are <a> tags OR divs with an onclick
-            const cards = Array.from(document.querySelectorAll('a, div[role="button"], .card'));
+        const channels = await page.evaluate((baseUrl) => {
+            // Target the cards/buttons specifically
+            const elements = Array.from(document.querySelectorAll('a, [onclick], .grid-item'));
             
-            return cards.map((card, index) => {
-                const name = card.innerText.trim();
-                const img = card.querySelector('img')?.src;
-                const link = card.href || card.getAttribute('onclick');
+            const filtered = elements.map((el) => {
+                const name = el.innerText.trim();
+                const img = el.querySelector('img')?.src || null;
+                const onclick = el.getAttribute('onclick') || "";
 
-                // Filter: Must have a name and either a link or be a valid card
-                // We exclude the 'Support', 'Close', and 'Version' text
-                const isJunk = /Support|Version|Close|Discord|Telegram|PH Radio|Stream Player|18\+|v1\./i.test(name);
-                
-                if (name && name.length > 1 && !isJunk) {
-                    return {
-                        id: String(index + 1),
-                        name: name,
-                        logoUrl: img || null,
-                        category: "LIVE",
-                        websiteUrl: link && link.startsWith('http') ? link : null,
-                        directUrl: null
-                    };
-                }
-                return null;
-            }).filter(x => x !== null && x.name !== "");
-        });
+                // 1. THE "JUNK" FILTER: Remove non-media tiles
+                const isJunk = /Contact|Support|Version|Close|Discord|Telegram|Update|v1\./i.test(name);
+                if (isJunk || !name || name.length < 2) return null;
 
-        // Deduplicate: Sometimes the scraper finds the same card twice
-        const uniqueChannels = Array.from(new Map(channels.map(item => [item.name, item])).values());
+                // 2. EXTRACT PLAY ID: Look for the slug in the onclick function
+                // Example: onclick="play('tv5')" -> extracts 'tv5'
+                const match = onclick.match(/'([^']+)'/);
+                const slug = match ? match[1] : null;
 
-        console.log(`Found ${uniqueChannels.length} unique channels.`);
-        cachedChannels = uniqueChannels;
+                return {
+                    name: name,
+                    logoUrl: img,
+                    category: "LIVE",
+                    websiteUrl: slug ? `${baseUrl}play/${slug}` : null
+                };
+            }).filter(item => item !== null && item.websiteUrl !== null);
+
+            // Deduplicate by name to prevent repeating "Contact Us" or navigation duplicates
+            return Array.from(new Map(filtered.map(c => [c.name, c])).values());
+        }, TARGET_SITE);
+
+        // Re-assign IDs so they are clean (1, 2, 3...) after filtering
+        const finalChannels = channels.map((c, i) => ({ id: String(i + 1), ...c }));
+
+        console.log(`Successfully indexed ${finalChannels.length} clean channels.`);
+        cachedChannels = finalChannels;
         lastFetchTime = Date.now();
-        return uniqueChannels;
+        return finalChannels;
 
     } catch (e) {
         console.error("Scrape Error:", e.message);
@@ -80,11 +81,11 @@ app.get('/channels', async (req, res) => {
 
 app.get('/resolve', async (req, res) => {
     const url = req.query.url;
-    if (!url || url === "null") return res.json({ error: "Invalid URL" });
+    if (!url) return res.status(400).json({ error: "No URL provided" });
     
     let browser;
     try {
-        browser = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+        browser = await chromium.launch({ args: ['--no-sandbox'] });
         const page = await browser.newPage();
         let streamData = { videoUrl: null, licenseUrl: null };
 
@@ -97,14 +98,18 @@ app.get('/resolve', async (req, res) => {
         });
 
         await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
-        await new Promise(r => setTimeout(r, 10000)); // Longer wait for DRM channels
+        await new Promise(r => setTimeout(r, 8000)); // Wait for player to init
+        
         res.json(streamData);
     } catch (e) {
-        res.json({ error: "Resolution failed" });
+        res.status(500).json({ error: e.message });
     } finally {
         if (browser) await browser.close();
     }
 });
 
-app.get('/', (req, res) => res.send("ACtv Proxy is live. Check /channels"));
-app.listen(port, "0.0.0.0", () => console.log(`Proxy running on port ${port}`));
+app.get('/', (req, res) => res.send("ACtv Backend: Online"));
+
+app.listen(port, "0.0.0.0", () => {
+    console.log(`ACtv Server running on port ${port}`);
+});
